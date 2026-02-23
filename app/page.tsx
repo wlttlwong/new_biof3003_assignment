@@ -7,9 +7,21 @@ import usePPGFromSamples from './hooks/usePPGFromSamples';
 import { computePPGFromRGB } from './lib/ppg';
 import type { SignalCombinationMode } from './components/SignalCombinationSelector';
 import SignalCombinationSelector from './components/SignalCombinationSelector';
+
+type SegmentLabel = 'good' | 'bad';
+
+const SEGMENT_LENGTH = 200;
+
 export default function Home() {
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
   const [backendStatus, setBackendStatus] = useState<string | null>(null);
+  const [segmentLabel, setSegmentLabel] = useState<SegmentLabel>('good');
+  const [segmentStatus, setSegmentStatus] = useState<string | null>(null);
+  const [inferenceResult, setInferenceResult] = useState<{
+    label: string | null;
+    confidence: number;
+    message?: string;
+  } | null>(null);
 
   // Inside component:
   const { videoRef, canvasRef, isRecording, setIsRecording, error } =
@@ -52,6 +64,56 @@ export default function Home() {
       );
     } catch (e) {
       setBackendStatus('Backend unreachable');
+    }
+  }
+  async function sendLabeledSegment() {
+    if (samples.length < 50) {
+      setSegmentStatus('Need more samples (start recording first)');
+      return;
+    }
+    setSegmentStatus(null);
+    const ppgSegment = samples.slice(-SEGMENT_LENGTH);
+    try {
+      const res = await fetch('/api/save-labeled-segment', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ppgData: ppgSegment, label: segmentLabel }),
+      });
+      const data = await res.json();
+      if (data.success) setSegmentStatus(`Saved as ${segmentLabel}`);
+      else setSegmentStatus('Error: ' + (data.error || 'Unknown'));
+    } catch {
+      setSegmentStatus('Error: request failed');
+    }
+  }
+  async function runInference() {
+    if (samples.length < 50) {
+      setInferenceResult({
+        label: null,
+        confidence: 0,
+        message: 'Need more samples',
+      });
+      return;
+    }
+    const segment = samples.slice(-SEGMENT_LENGTH);
+    try {
+      const res = await fetch('/api/infer-quality', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ppgData: segment }),
+      });
+      const data = await res.json();
+      setInferenceResult({
+        label: data.label ?? null,
+        confidence: data.confidence ?? 0,
+        message: data.message,
+      });
+    } catch {
+      setInferenceResult({
+        label: null,
+        confidence: 0,
+        message: 'Request failed',
+      });
     }
   }
   async function sendToApi() {
@@ -156,6 +218,65 @@ export default function Home() {
                   : '--'
               }
             />
+          </div>
+          <div className="mt-4 border-t pt-4">
+            <h3 className="font-medium mb-2">Collect labeled data (for ML)</h3>
+            <p className="text-sm text-gray-600 mb-2">
+              Choose a label, watch the signal until it matches, then click Send
+              to save this segment.
+            </p>
+            <div className="flex items-center gap-4 mb-2">
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="segmentLabel"
+                  checked={segmentLabel === 'good'}
+                  onChange={() => setSegmentLabel('good')}
+                />
+                Good
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  type="radio"
+                  name="segmentLabel"
+                  checked={segmentLabel === 'bad'}
+                  onChange={() => setSegmentLabel('bad')}
+                />
+                Bad
+              </label>
+            </div>
+            <button
+              onClick={sendLabeledSegment}
+              className="px-4 py-2 bg-amber-500 text-white rounded"
+            >
+              Send labeled segment
+            </button>
+            {segmentStatus && (
+              <p className="mt-2 text-sm">{segmentStatus}</p>
+            )}
+          </div>
+          <div className="mt-4 border-t pt-4">
+            <h3 className="font-medium mb-2">Signal quality (ML inference)</h3>
+            <button
+              onClick={runInference}
+              className="px-4 py-2 bg-purple-500 text-white rounded"
+            >
+              Check quality
+            </button>
+            {inferenceResult && (
+              <div className="mt-2 text-sm">
+                {inferenceResult.message && (
+                  <p className="text-gray-600">{inferenceResult.message}</p>
+                )}
+                {inferenceResult.label && (
+                  <p>
+                    Predicted: <strong>{inferenceResult.label}</strong>
+                    {inferenceResult.confidence > 0 &&
+                      ` (${(inferenceResult.confidence * 100).toFixed(0)}% confidence)`}
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
