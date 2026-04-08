@@ -45,34 +45,29 @@ export default function Home() {
     
     setUploadStatus("Uploading...");
     
+    // Create FormData to handle binary .pkl files properly
+    const formData = new FormData();
+    formData.append('model', modelFile);
+    formData.append('scaler', scalerFile);
+  
     try {
-      const toBase64 = (f: File): Promise<string> => new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => resolve((reader.result as string).split(',')[1]);
-        reader.onerror = (error) => reject(error);
-        reader.readAsDataURL(f);
-      });
+      const flaskBackendUrl = 'https://ltwonggg.pythonanywhere.com/upload-model';
   
-      // Now these lines will actually finish and move to the next step
-      const modelBase64 = await toBase64(modelFile);
-      const scalerBase64 = await toBase64(scalerFile);
-  
-      const res = await fetch('/api/upload-model', {
+      const res = await fetch(flaskBackendUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: modelBase64, scaler: scalerBase64 })
+        body: formData,
       });
   
       const data = await res.json();
       
-      if (res.ok && data.success) {
-        setUploadStatus('Model uploaded successfully');
+      if (res.ok) {
+        setUploadStatus('Model uploaded successfully to PythonAnywhere');
       } else {
-        setUploadStatus(data.error || 'Upload failed');
+        setUploadStatus(data.error || 'Upload failed: Check backend logs');
       }
     } catch (err) {
       console.error(err);
-      setUploadStatus('Upload failed: check connection');
+      setUploadStatus('Upload failed: check CORS or connection');
     }
   }
 
