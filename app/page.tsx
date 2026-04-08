@@ -13,13 +13,15 @@ import type { SignalCombinationMode } from './components/SignalCombinationSelect
 import SignalCombinationSelector from './components/SignalCombinationSelector';
 
 export default function Home() {
-  const { videoRef, canvasRef, isRecording, setIsRecording, error } =
-    useCamera();
+  const { videoRef, canvasRef, isRecording, setIsRecording, error } = useCamera();
   const [samples, setSamples] = useState<number[]>([]);
-  const [apiResponse, setApiResponse] = useState<object | null>(null);
   const { valleys, heartRate, hrv } = usePPGFromSamples(samples);
-  const [signalCombination, setSignalCombination] =
-    useState<SignalCombinationMode>('default');
+  const [signalCombination, setSignalCombination] = useState<SignalCombinationMode>('default');
+  const signalModeRef = useRef(signalCombination);
+  
+  useEffect(() => {
+    signalModeRef.current = signalCombination;
+  }, [signalCombination]);
 
   const [backendStatus, setBackendStatus] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<string | null>(null);
@@ -27,6 +29,52 @@ export default function Home() {
   type SegmentLabel = 'good' | 'bad';
   const [segmentLabel, setSegmentLabel] = useState<SegmentLabel>('good');
   const [segmentStatus, setSegmentStatus] = useState<string | null>(null);
+  const [labeledSegments, setLabeledSegments] = useState<{ ppgData: number[]; label: string }[]>([]);
+
+  const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const modelInputRef = useRef<HTMLInputElement>(null);
+  const scalerInputRef = useRef<HTMLInputElement>(null);
+  const [modelFile, setModelFile] = useState<File | null>(null);
+  const [scalerFile, setScalerFile] = useState<File | null>(null);
+
+  async function handleUploadModel() {
+    if (!modelFile || !scalerFile) {
+      setUploadStatus('Select both model and scaler files');
+      return;
+    }
+    
+    setUploadStatus("Uploading...");
+    
+    try {
+      const toBase64 = (f: File): Promise<string> => new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve((reader.result as string).split(',')[1]);
+        reader.onerror = (error) => reject(error);
+        reader.readAsDataURL(f);
+      });
+  
+      // Now these lines will actually finish and move to the next step
+      const modelBase64 = await toBase64(modelFile);
+      const scalerBase64 = await toBase64(scalerFile);
+  
+      const res = await fetch('/api/upload-model', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelBase64, scaler: scalerBase64 })
+      });
+  
+      const data = await res.json();
+      
+      if (res.ok && data.success) {
+        setUploadStatus('Model uploaded successfully');
+      } else {
+        setUploadStatus(data.error || 'Upload failed');
+      }
+    } catch (err) {
+      console.error(err);
+      setUploadStatus('Upload failed: check connection');
+    }
+  }
 
   const [inferenceResult, setInferenceResult] = useState<{
     label: string | null;
@@ -39,7 +87,27 @@ export default function Home() {
     samplesRef.current = samples;
   }, [samples]);
 
-  const INFERENCE_INTERVAL_MS = 2500;
+  // FIX: Explicitly stop camera hardware and toggle state
+  const handleToggleRecording = async () => {
+    if (isRecording) {
+      if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+      }
+      setIsRecording(false);
+    } else {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        if (videoRef.current) videoRef.current.srcObject = stream;
+        setIsRecording(true);
+      } catch (err) {
+        console.error("Camera access denied", err);
+      }
+    }
+  };
+
+  // Inference Logic
   useEffect(() => {
     if (!isRecording) return;
     let cancelled = false;
@@ -62,33 +130,71 @@ export default function Home() {
           });
         }
       } catch {
-        if (!cancelled) {
-          setInferenceResult({
-            label: null,
-            confidence: 0,
-            message: 'Request failed',
-          });
-        }
+        if (!cancelled) setInferenceResult({ label: null, confidence: 0, message: 'Request failed' });
       }
     }
-    run();
-    const id = setInterval(run, INFERENCE_INTERVAL_MS);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    const id = setInterval(run, 2500);
+    return () => { cancelled = true; clearInterval(id); };
   }, [isRecording]);
 
+  // Throttled Canvas Processing
+  useEffect(() => {
+    const video = videoRef.current;
+    const c = canvasRef.current;
+    if (!isRecording || !video || !c) return;
+  
+    const ctx = c.getContext('2d');
+    if (!ctx) return;
+  
+    let animationFrameId: number;
+    let lastUpdateTime = 0;
+    const targetFps = 30;
+    const msPerFrame = 1000 / targetFps;
+  
+    function tick(timestamp: number) {
+      if (!isRecording) return;
+      const v = videoRef.current;
+      const canvas = canvasRef.current;
+  
+      if (!v?.srcObject || v.readyState < 2 || !canvas) {
+        animationFrameId = requestAnimationFrame(tick);
+        return;
+      }
+  
+      if (timestamp - lastUpdateTime >= msPerFrame) {
+        canvas.width = v.videoWidth;
+        canvas.height = v.videoHeight;
+        ctx!.drawImage(v, 0, 0);
+  
+        const w = 10, h = 10;
+        const x = (canvas.width - w) / 2;
+        const y = (canvas.height - h) / 2;
+        const data = ctx!.getImageData(x, y, w, h).data;
+        
+        let rSum = 0, gSum = 0, bSum = 0, pixelCount = 0;
+        for (let i = 0; i < data.length; i += 4) {
+          rSum += data[i]; gSum += data[i + 1]; bSum += data[i + 2];
+          pixelCount += 1;
+        }
+
+        const ppgValue = computePPGFromRGB(rSum, gSum, bSum, pixelCount, signalModeRef.current);
+        setSamples((prev) => [...prev.slice(-(SAMPLES_TO_KEEP - 1)), ppgValue]);
+        lastUpdateTime = timestamp;
+      }
+      animationFrameId = requestAnimationFrame(tick);
+    }
+  
+    animationFrameId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(animationFrameId);
+  }, [isRecording]);
+
+  // API Handlers
   async function checkBackend() {
     try {
       const res = await fetch('/api/health');
       const data = await res.json();
-      setBackendStatus(
-        data.ok ? 'Backend OK' : 'Backend returned unexpected data',
-      );
-    } catch (e) {
-      setBackendStatus('Backend unreachable');
-    }
+      setBackendStatus(data.ok ? 'Backend OK' : 'Backend returned unexpected data');
+    } catch { setBackendStatus('Backend unreachable'); }
   }
 
   async function sendLabeledSegment() {
@@ -96,7 +202,6 @@ export default function Home() {
       setSegmentStatus('Need more samples (start recording first)');
       return;
     }
-    setSegmentStatus(null);
     const ppgSegment = samples.slice(-SAMPLES_TO_KEEP);
     try {
       const res = await fetch('/api/save-labeled-segment', {
@@ -105,21 +210,17 @@ export default function Home() {
         body: JSON.stringify({ ppgData: ppgSegment, label: segmentLabel }),
       });
       const data = await res.json();
-      if (data.success) setSegmentStatus(`Saved as ${segmentLabel}`);
-      else setSegmentStatus('Error: ' + (data.error || 'Unknown'));
-    } catch {
-      setSegmentStatus('Error: request failed');
-    }
+      if (data.success) {
+        setSegmentStatus(`Saved as ${segmentLabel}`);
+        setLabeledSegments((prev) => [...prev, { ppgData: ppgSegment, label: segmentLabel }]);
+      }
+    } catch { setSegmentStatus('Error: request failed'); }
   }
 
   async function saveRecord() {
-    setSaveStatus(null);
     const record = {
       heartRate: { bpm: heartRate.bpm, confidence: heartRate.confidence },
-      hrv: {
-        sdnn: hrv?.sdnn ?? 0,
-        confidence: hrv?.confidence ?? 0,
-      },
+      hrv: { sdnn: hrv?.sdnn ?? 0, confidence: hrv?.confidence ?? 0 },
       ppgData: samples.slice(-SAMPLES_TO_KEEP),
       timestamp: new Date().toISOString(),
     };
@@ -130,238 +231,164 @@ export default function Home() {
         body: JSON.stringify(record),
       });
       const data = await res.json();
-      if (data.success) setSaveStatus('Saved');
-      else setSaveStatus('Error: ' + (data.error || 'Unknown'));
-    } catch (e) {
-      setSaveStatus('Error: request failed');
-    }
+      setSaveStatus(data.success ? 'Saved' : 'Error saving');
+    } catch { setSaveStatus('Error: request failed'); }
   }
 
-  async function sendToApi() {
-    const res = await fetch('/api/echo', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        samples: samples.slice(-10),
-        timestamp: Date.now(),
-      }),
-    });
-    const data = await res.json();
-    setApiResponse(data);
+  function downloadLabeledJson() {
+    const blob = new Blob([JSON.stringify(labeledSegments, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'labeled_records.json';
+    a.click();
+    URL.revokeObjectURL(url);
   }
-
-  useEffect(() => {
-    const video = videoRef.current;
-    const c = canvasRef.current;
-    if (!isRecording || !video || !c) return;
-
-    const ctx = c.getContext('2d');
-    if (!ctx) return;
-
-    let running = true;
-    function tick() {
-      if (!running || !ctx) return;
-      const v = videoRef.current;
-      const c = canvasRef.current;
-      if (!v?.srcObject || !v.videoWidth || !c) {
-        requestAnimationFrame(tick);
-        return;
-      }
-      c.width = v.videoWidth;
-      c.height = v.videoHeight;
-      ctx.drawImage(v, 0, 0);
-      const w = 10,
-        h = 10;
-      const x = (c.width - w) / 2;
-      const y = (c.height - h) / 2;
-      ctx.strokeStyle = 'red';
-      ctx.lineWidth = 2;
-      ctx.strokeRect(x, y, w, h);
-      const data = ctx.getImageData(x, y, w, h).data;
-      let rSum = 0,
-        gSum = 0,
-        bSum = 0,
-        pixelCount = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        rSum += data[i];
-        gSum += data[i + 1];
-        bSum += data[i + 2];
-        pixelCount += 1;
-      }
-      const ppgValue = computePPGFromRGB(
-        rSum,
-        gSum,
-        bSum,
-        pixelCount,
-        signalCombination,
-      );
-
-      setSamples((prev) => [...prev.slice(-(SAMPLES_TO_KEEP - 1)), ppgValue]);
-
-      requestAnimationFrame(tick);
-    }
-    tick();
-    return () => {
-      running = false;
-    };
-  }, [isRecording, signalCombination]);
 
   return (
-    <main className="p-8">
-      <h1 className="text-xl font-bold mb-4">Canvas sampling and POST</h1>
+    <main className="min-h-screen bg-[#F8FAFC] py-12 px-4 font-sans text-slate-700">
+      {/* HEADER SECTION */}
+      <header className="text-center space-y-4 mb-10 max-w-3xl mx-auto">
+        <div className="inline-flex items-center justify-center w-12 h-12 rounded-2xl bg-white shadow-sm border border-slate-100 text-rose-500 text-xl">❤️</div>
+        <h1 className="text-3xl font-bold text-slate-900">PPG Heart-Rate Monitor</h1>
+        <p className="text-slate-500 max-w-xl mx-auto text-sm">
+          Place your finger over the camera to measure heart rate, HRV, and signal quality.
+          Collect labeled data, train your model, and upload for inference.
+        </p>
+      </header>
 
-      <div className="mb-4">
-        <h2 className="text-lg font-semibold mb-2">Camera</h2>
-        <div className="w-96 max-w-full border border-gray-400 bg-black min-h-[240px] flex items-center justify-center overflow-hidden rounded">
-          <video ref={videoRef} autoPlay muted playsInline className="hidden" />
-          {isRecording ? (
-            <canvas
-              ref={canvasRef}
-              className="w-full h-full min-h-[240px] object-contain"
-            />
-          ) : (
-            <span className="text-gray-500 text-sm">
-              Start recording to see camera
-            </span>
-          )}
+      <div className="max-w-6xl mx-auto flex flex-col lg:flex-row gap-8 items-start">
+        
+        {/* LEFT COLUMN: Camera */}
+        <div className="w-full lg:w-1/2 lg:sticky lg:top-8 space-y-6">
+          <section className="bg-white rounded-[24px] p-8 shadow-sm border border-slate-100">
+            <div className="flex items-center gap-2 mb-6">
+              <div className="w-2 h-2 rounded-full bg-[#10B981]" />
+              <h2 className="text-sm font-bold text-slate-800 uppercase tracking-wider">Camera</h2>
+            </div>
+    
+            <div className="space-y-6">
+              {isRecording && (
+                <div className="relative w-full aspect-video bg-black rounded-2xl overflow-hidden shadow-inner">
+                  <video ref={videoRef} autoPlay muted playsInline className="hidden" />
+                  <canvas ref={canvasRef} className="w-full h-full object-contain" />
+                  <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-4 h-4 border-2 border-red-500 pointer-events-none" />
+                </div>
+              )}
+              
+              <button
+                onClick={handleToggleRecording}
+                className={`px-6 py-2.5 rounded-xl font-bold text-sm transition-all shadow-md ${
+                  isRecording ? 'bg-[#065F46] text-white' : 'bg-[#10B981] text-white hover:bg-[#059669]'
+                }`}
+              >
+                {isRecording ? 'Stop recording' : 'Start recording'}
+              </button>
+              {error && <p className="text-red-500 text-xs mt-2">{error}</p>}
+            </div>
+          </section>
+
+          <footer className="flex justify-center lg:justify-start gap-4 pt-4">
+            <button onClick={checkBackend} className="text-[10px] font-bold text-slate-400 hover:text-slate-600 uppercase tracking-widest italic">Check Backend Status</button>
+            <button onClick={saveRecord} className="px-6 py-2 bg-white border border-slate-200 text-slate-600 text-xs font-black rounded-full shadow-sm">Save Session</button>
+          </footer>
         </div>
-        <div className="mt-2">
-          <button
-            onClick={() => setIsRecording((r) => !r)}
-            className="px-4 py-2 bg-green-500 text-white rounded"
-          >
-            {isRecording ? 'Stop recording' : 'Start recording'}
-          </button>
-          {error && <p className="text-red-600 mt-2">{error}</p>}
+
+        {/* RIGHT COLUMN: Data, Metrics, and ML */}
+        <div className="w-full lg:w-1/2 space-y-6">
+          {/* 3. SIGNALS & METRICS SECTION */}
+          <section className="bg-white rounded-[24px] p-8 shadow-sm border border-slate-100">
+            <div className="flex items-center gap-2 mb-6">
+              <div className="w-2 h-2 rounded-full bg-[#3B82F6]" />
+              <h2 className="text-sm font-bold text-slate-800 tracking-wider">Signal & Metrics</h2>
+            </div>
+
+            <div className="space-y-6">
+              <div className='max-w-md'>
+                <SignalCombinationSelector value={signalCombination} onChange={setSignalCombination} />
+              </div>
+
+              <div className="bg-white border border-slate-100 rounded-2xl p-4 shadow-sm">
+                <div className="h-full w-full pb-8">
+                  <ChartComponent ppgData={samples} valleys={valleys} />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div className="bg-slate-50/50 border border-slate-100 rounded-2xl p-4 text-center lg:text-left">
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Heart Rate</p>
+                  <p className="text-xl font-bold text-slate-900">{heartRate.bpm > 0 ? `${heartRate.bpm} bpm` : '--'}</p>
+                </div>
+                <div className="bg-slate-50/50 border border-slate-100 rounded-2xl p-4 text-center lg:text-left">
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Confidence</p>
+                  <p className="text-xl font-bold text-slate-900">{heartRate.confidence > 0 ? `${heartRate.confidence.toFixed(0)}%` : '--'}</p>
+                </div>
+                <div className="bg-slate-50/50 border border-slate-100 rounded-2xl p-4 text-center lg:text-left">
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">HRV</p>
+                  <p className="text-xl font-bold text-slate-900">{hrv.sdnn > 0 ? `${hrv.sdnn.toFixed(0)} ms` : '--'}</p>
+                </div>
+                <div className="bg-slate-50/50 border border-slate-100 rounded-2xl p-4 text-center lg:text-left">
+                  <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-1">Quality</p>
+                  <p className={`text-xl font-bold ${inferenceResult?.label === 'good' ? 'text-emerald-600' : 'text-rose-600'}`}>
+                    {inferenceResult?.label ? inferenceResult.label : 'N/A'}
+                  </p>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          {/* 4. UPLOAD MODEL SECTION */}
+          <section className="bg-white rounded-[24px] p-8 shadow-sm border border-slate-100">
+            <div className="flex flex-col gap-1 mb-6">
+              <div className="flex items-center gap-2">
+                <div className="w-2 h-2 rounded-full bg-[#6366F1]" />
+                <h2 className="text-sm font-bold text-slate-800 tracking-wider">Upload trained model</h2>
+              </div>
+            </div>
+            <div className="space-y-3 ml-4">
+              <input type="file" ref={modelInputRef} className="hidden" onChange={(e) => setModelFile(e.target.files?.[0] || null)} />
+              <input type="file" ref={scalerInputRef} className="hidden" onChange={(e) => setScalerFile(e.target.files?.[0] || null)} />
+              <div className="flex items-center gap-3">
+                <button onClick={() => modelInputRef.current?.click()} className="flex items-center gap-2 px-4 py-1.5 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 transition shadow-sm">
+                  <span className="text-[14px]">📄</span>
+                  <span className="text-xs font-bold text-slate-700">Model file</span>
+                </button>
+                <span className="text-[11px] text-slate-400 font-medium">{modelFile ? modelFile.name : "Not selected"}</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <button onClick={() => scalerInputRef.current?.click()} className="flex items-center gap-2 px-4 py-1.5 bg-slate-50 border border-slate-200 rounded-lg hover:bg-slate-100 transition shadow-sm">
+                  <span className="text-[14px]">📄</span>
+                  <span className="text-xs font-bold text-slate-700">Scaler file</span>
+                </button>
+                <span className="text-[11px] text-slate-400 font-medium">{scalerFile ? scalerFile.name : "Not selected"}</span>
+              </div>
+              <div className="flex items-center gap-4 pt-4">
+                <button onClick={handleUploadModel} disabled={!modelFile || !scalerFile} className={`flex items-center gap-2 px-6 py-2 rounded-xl text-xs font-bold transition-all shadow-md ${modelFile && scalerFile ? 'bg-[#6366F1] text-white hover:bg-[#4F46E5]' : 'bg-slate-200 text-slate-400 cursor-not-allowed'}`}>
+                  <span>📤</span> Upload model
+                </button>
+              </div>
+            </div>
+          </section>
+
+          {/* 5. ML SECTION */}
+          <section className="bg-white rounded-[24px] p-8 shadow-sm border border-slate-100">
+            <div className="flex items-center gap-2 mb-6">
+              <div className="w-2 h-2 rounded-full bg-[#F59E0B]" />
+              <h2 className="text-sm font-bold text-slate-800 tracking-wider">Collect Labeled Data</h2>
+            </div>
+            <div className="space-y-6">
+              <div className="flex items-center gap-6">
+                <label className="flex items-center gap-2 cursor-pointer"><input type="radio" checked={segmentLabel === 'good'} onChange={() => setSegmentLabel('good')} className="accent-[#10B981]" /> Good</label>
+                <label className="flex items-center gap-2 cursor-pointer"><input type="radio" checked={segmentLabel === 'bad'} onChange={() => setSegmentLabel('bad')} className="accent-rose-500" /> Bad</label>
+              </div>
+              <div className="flex gap-4">
+                <button onClick={sendLabeledSegment} className="px-5 py-2 bg-[#F59E0B] text-white text-xs font-bold rounded-xl">Send Segment</button>
+                <button onClick={downloadLabeledJson} className="px-5 py-2 bg-white border border-slate-200 text-slate-600 text-xs font-bold rounded-xl" disabled={labeledSegments.length === 0}>Download JSON</button>
+              </div>
+            </div>
+          </section>
         </div>
       </div>
-
-      <div className="mt-4">
-        <ChartComponent
-          ppgData={samples.slice(-SAMPLES_TO_KEEP)}
-          valleys={valleys}
-        />
-        <SignalCombinationSelector
-          value={signalCombination}
-          onChange={setSignalCombination}
-        />
-        <div className="mt-2 flex flex-wrap gap-4">
-          <SimpleCard
-            title="Heart rate"
-            value={heartRate.bpm > 0 ? `${heartRate.bpm} bpm` : '--'}
-          />
-          <SimpleCard
-            title="Confidence"
-            value={
-              heartRate.confidence > 0
-                ? `${heartRate.confidence.toFixed(0)}%`
-                : '--'
-            }
-          />
-          <SimpleCard
-            title="HRV"
-            value={hrv.sdnn > 0 ? `${hrv.sdnn} ms` : '--'}
-          />
-        </div>
-      </div>
-      <div className="mt-4 flex flex-wrap gap-4">
-        <SimpleCard
-          title="Current PPG"
-          value={samples[samples.length - 1]?.toFixed(1) ?? '-'}
-        />
-        <SimpleCard
-          title="Last 20"
-          value={
-            samples
-              .slice(-20)
-              .map((s) => s.toFixed(0))
-              .join(', ') || '-'
-          }
-        />
-      </div>
-      <div className="mt-4 flex flex-wrap gap-4">
-          <button
-            onClick={checkBackend}
-            className="px-4 py-2 bg-gray-500 text-white rounded"
-          >
-            Check backend
-          </button>
-          <button
-            onClick={saveRecord}
-            className="px-4 py-2 bg-green-500 text-white rounded"
-          >
-            Save record
-          </button>
-        </div>
-        {backendStatus && <p className="mt-2 text-sm">{backendStatus}</p>}
-        {saveStatus && <p className="mt-2 text-sm">{saveStatus}</p>}
-
-        <div className="mt-4 border-t pt-4">
-          <h3 className="font-medium mb-2">Collect labeled data (for ML)</h3>
-          <p className="text-sm text-gray-600 mb-2">
-            Choose a label, watch the signal until it matches, then click Send to
-            save this segment.
-          </p>
-          <div className="flex items-center gap-4 mb-2">
-            <label className="flex items-center gap-2">
-              <input
-                type="radio"
-                name="segmentLabel"
-                checked={segmentLabel === 'good'}
-                onChange={() => setSegmentLabel('good')}
-              />
-              Good
-            </label>
-            <label className="flex items-center gap-2">
-              <input
-                type="radio"
-                name="segmentLabel"
-                checked={segmentLabel === 'bad'}
-                onChange={() => setSegmentLabel('bad')}
-              />
-              Bad
-            </label>
-          </div>
-          <button
-            onClick={sendLabeledSegment}
-            className="px-4 py-2 bg-amber-500 text-white rounded"
-          >
-            Send labeled segment
-          </button>
-          {segmentStatus && <p className="mt-2 text-sm">{segmentStatus}</p>}
-          {/* Assignment: Add "Download labeled_records.json" button here (Additional Work 1). */}
-        </div>
-
-        {/* Assignment: Add Upload model and scaler UI here (Additional Work 2). */}
-        <div className="mt-4 border-t pt-4">
-          <h3 className="font-medium mb-2">Signal quality (ML inference)</h3>
-          <p className="text-sm text-gray-600 mb-2">
-            Quality updates continuously while recording (when enough samples are
-            available).
-          </p>
-          <div className="mt-2 text-sm">
-            {inferenceResult?.message && (
-              <p className="text-gray-600">{inferenceResult.message}</p>
-            )}
-            {inferenceResult?.label ? (
-              <p>
-                Predicted: <strong>{inferenceResult.label}</strong>
-                {inferenceResult.confidence > 0 &&
-                  ` (${(inferenceResult.confidence * 100).toFixed(0)}% confidence)`}
-              </p>
-            ) : (
-              <p className="text-gray-500">
-                {isRecording && samples.length < MIN_SAMPLES_FOR_DETECTION
-                  ? 'Collecting samples…'
-                  : !isRecording
-                    ? 'Start recording for quality inference'
-                    : '--'}
-              </p>
-            )}
-          </div>
-        </div>
-      </main>
-
-
+    </main>
   );
 }
